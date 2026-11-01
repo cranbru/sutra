@@ -41,6 +41,25 @@ Inspect permissions and server context:
 & .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe scan --inspect-acl
 ```
 
+Save a point-in-time inventory and compare it with the prior saved snapshot:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe scan --snapshot
+```
+
+Save ACL and process metadata in the snapshot by combining `--inspect-acl` and `--snapshot`. These snapshots contain the inspection results gathered at that time.
+
+Review snapshots, compare the latest pair, ingest Sysmon pipe events, or view the stored event timeline:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe history
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe changes
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe events --since-hours 24
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe activity
+```
+
+Use `--db <path>` with snapshot, history, changes, events, or activity commands to select a database other than the default `%LOCALAPPDATA%\Sutra\sutra.db`.
+
 Show command help:
 
 ```powershell
@@ -48,6 +67,10 @@ Show command help:
 ```
 
 `--inspect-acl` opens each available endpoint to retrieve its security descriptor and server process ID. It also attempts to read the process user SID, elevation state, and services hosted in that process. Busy, inaccessible, exited, or protected processes may provide incomplete metadata. Use this option only where briefly triggering endpoint connection handling is acceptable.
+
+`events` reads Event IDs 17 and 18 from `Microsoft-Windows-Sysmon/Operational` for the selected lookback window, normalizes pipe-name prefixes, and matches event names against the current name-only inventory. It stores distinct events by channel and record ID. Sysmon must be installed with pipe event logging enabled, and the current account must be able to read the channel. `activity` reads previously ingested events from SQLite without querying the event log.
+
+SUTRA stores snapshots and event history in a local SQLite database under `%LOCALAPPDATA%\Sutra\sutra.db` by default. The database can contain pipe names, process names and IDs, SIDs, ACL entries, findings, timestamps, and event data. Keep it local or protect it according to your organization’s data-handling rules.
 
 ## What the results mean
 
@@ -62,7 +85,7 @@ Show command help:
 
 Permission findings focus on allow ACEs for broad local principals and distinguish read access from write or security-control permissions. A null or absent DACL is reported as unrestricted. Severity reflects the known server context; when that context is unknown, write findings remain medium rather than assuming a privileged server. Recommendations are provided with each finding.
 
-Findings are indicators for review, not proof of exploitability. The current analysis does not fully evaluate effective access across ordered, inherited, conditional, or group-derived ACEs, nor does it inspect each server's application protocol. Pipe names and process metadata are a point-in-time view and can change during a scan.
+Findings are indicators for review, not proof of exploitability. The current analysis does not fully evaluate effective access across ordered, inherited, conditional, or group-derived ACEs, nor does it inspect each server's application protocol. Pipe names and process metadata are a point-in-time view and can change during a scan. Event correlation matches names against the live inventory at import time; it does not prove that an event created or connected to the same endpoint instance.
 
 ## Build and test
 

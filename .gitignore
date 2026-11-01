@@ -19,6 +19,10 @@
 *.key
 secrets.json
 appsettings.Local.json
+*.db
+*.db-*
+*.sqlite
+*.sqlite-*
 
 # Logs and temporary files
 *.log
