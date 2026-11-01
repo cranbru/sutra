@@ -15,7 +15,15 @@ public static class SutraApp
 {
     public static async Task<int> RunAsync(string[] args)
     {
-        if (args.Length == 0 || args[0] is "help" or "--help" or "-h")
+        if (args.Length == 0)
+        {
+            if (!Console.IsInputRedirected) return await RunDashboardAsync();
+            ShowBanner();
+            ShowHelp();
+            return 0;
+        }
+
+        if (args[0] is "help" or "--help" or "-h")
         {
             ShowBanner();
             ShowHelp();
@@ -338,10 +346,10 @@ public static class SutraApp
             var choice = AnsiConsole.Prompt(new SelectionPrompt<string>()
                 .Title("[cyan]SUTRA dashboard[/]")
                 .PageSize(8)
-                .AddChoices("Scan pipes", "Scan and save snapshot", "History", "Changes", "Recent activity", "Help", "Exit"));
+                .AddChoices("Scan IPC", "Scan and save snapshot", "History", "Changes", "Recent activity", "Help", "Exit"));
             switch (choice)
             {
-                case "Scan pipes": await RunScanAsync([]); break;
+                case "Scan IPC": await RunScanAsync([]); break;
                 case "Scan and save snapshot": await RunScanAsync(["--snapshot"]); break;
                 case "History": RunHistory([]); break;
                 case "Changes": RunChanges([]); break;
