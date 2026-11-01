@@ -1,41 +1,72 @@
 # SUTRA
 
-SUTRA is a Windows only, read only IPC attack surface mapper. Stage 1 inventories named pipes from the Windows pipe namespace and can request owner and DACL metadata.
+SUTRA is a Windows command-line tool for inspecting the named-pipe IPC attack surface. It inventories pipe endpoints and can retrieve their security owners and access-control entries (ACEs), presenting results in a readable terminal interface.
 
-## Run
+The default scan enumerates pipe names without connecting to endpoints. Security inspection is optional because Windows may need to open a client handle to retrieve a pipe’s security descriptor. This can briefly connect to an available server and trigger its connection handling.
+
+## Requirements
+
+- Windows 10 or later
+- .NET 10 SDK to build from source
+
+## Install from source
+
+Clone the repository and publish a self-contained Windows executable:
 
 ```powershell
-dotnet run --project src/Sutra.Cli -- scan
-dotnet run --project src/Sutra.Cli -- scan --inspect-acl
-dotnet run --project src/Sutra.Cli -- help
+git clone https://github.com/cranbru/sutra.git
+Set-Location sutra
+dotnet publish .\src\Sutra.Cli\Sutra.Cli.csproj -c Release -r win-x64 --self-contained true -p:PublishSingleFile=true
 ```
 
-`scan` enumerates pipe names only. `--inspect-acl` calls the Windows security API for each discovered pipe. Windows may need to open a client handle to obtain a pipe security descriptor; this can briefly connect to an available server and trigger its connection handling. Use the option only where that effect is acceptable. Inaccessible or busy pipes are reported with their Windows error.
+The executable is created at:
 
-Server process IDs are not queried in Stage 1. The documented named pipe server PID API requires a connected pipe handle, which can have the same endpoint side effect. SUTRA leaves the PID unavailable rather than connect silently or infer a process from a pipe name.
+```text
+src/Sutra.Cli/bin/Release/net10.0/win-x64/publish/sutra.exe
+```
+
+The self-contained build includes the .NET runtime. To build for Windows on ARM64, use `-r win-arm64` in the publish command.
+
+## Usage
+
+Run a named-pipe inventory:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe scan
+```
+
+Request owner and DACL metadata as well:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe scan --inspect-acl
+```
+
+Show command help:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe help
+```
+
+`--inspect-acl` can briefly connect to an available endpoint while Windows retrieves its security descriptor. Busy or inaccessible endpoints are reported with the associated error. Use this option where that connection side effect is acceptable.
+
+## What the results mean
+
+- **Endpoint** is the pipe name discovered in the Windows named-pipe namespace.
+- **Found** means the endpoint appeared in the enumeration.
+- **ACL** indicates whether its security descriptor could be read.
+- **Owner SID** identifies the descriptor owner when available.
+- **ACEs** lists access-control entries with the type, trustee SID, access mask, and flags.
+- **PID** is unavailable because SUTRA does not connect to endpoints to query server process IDs.
+
+Pipe names are a point-in-time inventory. Endpoints can disappear or become busy between enumeration and optional security inspection. Process and service attribution, risk scoring, event correlation, and report export are not provided by the current command set.
 
 ## Build and test
 
 ```powershell
-dotnet build Sutra.slnx
-dotnet test Sutra.slnx
+dotnet build .\Sutra.slnx -c Release
+dotnet test .\Sutra.slnx -c Release
 ```
 
-## Stage 1 structure
+## License
 
-```text
-src/Sutra.Cli/
-  Models/       Pipe endpoint and ACE records
-  Native/       Windows pipe enumeration and security descriptor access
-  Program.cs    CLI entry point
-  SutraApp.cs   Spectre.Console startup, commands and result views
-tests/Sutra.Tests/
-  PipePathTests.cs
-```
-
-## Known limits
-
-- Pipe names are a point in time inventory; endpoints can disappear during later inspection.
-- Owner and DACL inspection can fail because the pipe is busy or access is denied.
-- Process and service attribution is not included yet.
-- Stage 1 does not score permissions or classify risk.
+No license has been specified yet.
