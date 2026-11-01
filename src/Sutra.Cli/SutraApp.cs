@@ -1,9 +1,11 @@
 using Spectre.Console;
+using System.Text;
 using System.Runtime.Versioning;
 using Sutra.Cli.Analysis;
 using Sutra.Cli.Correlation;
 using Sutra.Cli.Models;
 using Sutra.Cli.Native;
+using Sutra.Cli.Reporting;
 using Sutra.Cli.Storage;
 
 namespace Sutra.Cli;
@@ -26,6 +28,8 @@ public static class SutraApp
             "changes" => RunChanges(args[1..]),
             "events" => RunEvents(args[1..]),
             "activity" => RunActivity(args[1..]),
+            "report" => RunStoredReport(args[1..]),
+            "dashboard" => await RunDashboardAsync(),
             _ => UnknownCommand(args[0])
         };
     }
@@ -38,31 +42,46 @@ public static class SutraApp
 
     private static async Task<int> RunScanAsync(string[] args)
     {
-        if (!TryParseOptions(args, ["--inspect-acl", "--snapshot"], ["--db"], out var options, out var error))
+        string[] values = ["--db", "--format", "--output", "--scope", "--search", "--process", "--service", "--elevated", "--severity", "--sort", "--order", "--limit"];
+        if (!TryParseOptions(args, ["--inspect-acl", "--snapshot"], values, out var options, out var error))
         {
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
             return 2;
         }
         var inspectAcl = options.ContainsKey("--inspect-acl");
         var saveSnapshot = options.ContainsKey("--snapshot");
-        if (options.ContainsKey("--db") && !saveSnapshot)
+        if (!TryGetFormat(options, out var format, out error))
         {
-            AnsiConsole.MarkupLine("[red]--db is only valid with --snapshot.[/]");
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
+            return 2;
+        }
+        if (!TryBuildFilter(options, out var filter, out error))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
+            return 2;
+        }
+        if (options.ContainsKey("--severity") && !inspectAcl)
+        {
+            AnsiConsole.MarkupLine("[red]--severity requires --inspect-acl.[/]");
             return 2;
         }
         if (!OperatingSystem.IsWindows()) { RequireWindows(); return 2; }
 
-        ShowBanner();
-        var scanDescription = saveSnapshot ? "named-pipe inventory · snapshot capture" : "named-pipe inventory · read-only scan";
-        AnsiConsole.MarkupLine($"[grey]{scanDescription}[/]");
-        AnsiConsole.WriteLine();
+        var terminalOutput = format == ReportFormat.Table && !options.ContainsKey("--output");
+        if (terminalOutput)
+        {
+            ShowBanner();
+            var scanDescription = saveSnapshot ? "named-pipe inventory · snapshot capture" : "named-pipe inventory · read-only scan";
+            AnsiConsole.MarkupLine($"[grey]{scanDescription}[/]");
+            AnsiConsole.WriteLine();
+        }
         IReadOnlyList<PipeEndpoint> endpoints;
         try
         {
-            endpoints = await AnsiConsole.Status()
-                .Spinner(Spinner.Known.Dots)
-                .SpinnerStyle(Style.Parse("cyan"))
-                .StartAsync("Discovering named-pipe endpoints…", _ => Task.FromResult(new PipeEnumerator().Discover()));
+            endpoints = terminalOutput
+                ? await AnsiConsole.Status().Spinner(Spinner.Known.Dots).SpinnerStyle(Style.Parse("cyan"))
+                    .StartAsync("Discovering named-pipe endpoints…", _ => Task.FromResult(new PipeEnumerator().Discover()))
+                : new PipeEnumerator().Discover();
         }
         catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or PlatformNotSupportedException)
         {
@@ -70,21 +89,48 @@ public static class SutraApp
             return 1;
         }
 
-        var inspected = inspectAcl ? await InspectSecurityWindowsAsync(endpoints) : endpoints;
-        RenderResults(inspected, inspectAcl);
+        var inspected = inspectAcl ? await InspectSecurityWindowsAsync(endpoints, terminalOutput) : endpoints;
+        SnapshotSaveResult? snapshotResult = null;
         if (saveSnapshot)
         {
             try
             {
-                var result = new SqliteHistoryStore(GetDatabasePath(options)).SaveSnapshot(inspected);
-                AnsiConsole.MarkupLine($"[cyan]Snapshot saved[/]  {result.Snapshot.Id}  ·  {result.Snapshot.CapturedUtc.ToLocalTime():yyyy-MM-dd HH:mm:ss}  ·  {result.Snapshot.EndpointCount} endpoints");
-                RenderChanges(result.Changes, "Changes since previous snapshot");
+                snapshotResult = new SqliteHistoryStore(GetDatabasePath(options)).SaveSnapshot(inspected);
             }
             catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
             {
                 AnsiConsole.MarkupLine($"[red]Could not save snapshot:[/] {Markup.Escape(ex.Message)}");
                 return 1;
             }
+        }
+
+        var selected = ScanReportFormatter.FilterAndSort(inspected, filter);
+        var recentEvents = ReadEventsForEndpoints(selected, GetDatabasePath(options));
+        var source = snapshotResult is null ? "Live scan" : $"Snapshot {snapshotResult.Snapshot.Id}";
+        var report = ScanReportFormatter.CreateDocument(selected, source, recentEvents);
+        if (options.TryGetValue("--output", out var outputPath))
+        {
+            try
+            {
+                WriteReportFile(outputPath!, RenderFormat(format, report, selected, recentEvents));
+                AnsiConsole.MarkupLine($"[green]Report written:[/] {Markup.Escape(Path.GetFullPath(outputPath!))}");
+            }
+            catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
+            {
+                AnsiConsole.MarkupLine($"[red]Could not write report:[/] {Markup.Escape(ex.Message)}");
+                return 1;
+            }
+        }
+        else if (terminalOutput) RenderResults(selected, inspectAcl);
+        else Console.Write(RenderFormat(format, report, selected, recentEvents));
+
+        if (snapshotResult is not null)
+        {
+            var structuredStdout = !options.ContainsKey("--output")
+                && format is (ReportFormat.Json or ReportFormat.Dot or ReportFormat.Ascii);
+            var destination = structuredStdout ? Console.Error : Console.Out;
+            destination.WriteLine($"Snapshot saved: {snapshotResult.Snapshot.Id} ({snapshotResult.Snapshot.EndpointCount} endpoints)");
+            if (terminalOutput) RenderChanges(snapshotResult.Changes, "Changes since previous snapshot");
         }
         return 0;
     }
@@ -214,6 +260,76 @@ public static class SutraApp
         }
     }
 
+    private static int RunStoredReport(string[] args)
+    {
+        string[] reportOptions = ["--db", "--snapshot", "--format", "--output", "--scope", "--search", "--process", "--service", "--elevated", "--severity", "--sort", "--order", "--limit"];
+        if (!TryParseOptions(args, [], reportOptions, out var options, out var error))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
+            return 2;
+        }
+        if (!TryGetFormat(options, out var format, out error) || !TryBuildFilter(options, out var filter, out error))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
+            return 2;
+        }
+        try
+        {
+            var store = new SqliteHistoryStore(GetDatabasePath(options));
+            var snapshotId = options.TryGetValue("--snapshot", out var requestedId) ? requestedId! : "latest";
+            var snapshot = store.GetSnapshot(snapshotId);
+            if (snapshot is null)
+            {
+                AnsiConsole.MarkupLine("[yellow]No matching snapshot was found. Run [cyan]sutra scan --snapshot[/] first.[/]");
+                return 0;
+            }
+            var endpoints = ScanReportFormatter.FilterAndSort(store.GetSnapshotEndpoints(snapshot.Id), filter);
+            var events = ReadEventsForEndpoints(endpoints, GetDatabasePath(options));
+            var report = ScanReportFormatter.CreateDocument(endpoints, $"Snapshot {snapshot.Id}", events);
+            if (options.TryGetValue("--output", out var outputPath))
+            {
+                WriteReportFile(outputPath!, RenderFormat(format, report, endpoints, events));
+                AnsiConsole.MarkupLine($"[green]Report written:[/] {Markup.Escape(Path.GetFullPath(outputPath!))}");
+            }
+            else if (format == ReportFormat.Table)
+                RenderResults(endpoints, endpoints.Any(endpoint => endpoint.SecurityStatus == "Inspected"));
+            else Console.Write(RenderFormat(format, report, endpoints, events));
+            return 0;
+        }
+        catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException or ArgumentException)
+        {
+            AnsiConsole.MarkupLine($"[red]Could not generate report:[/] {Markup.Escape(ex.Message)}");
+            return 1;
+        }
+    }
+
+    private static async Task<int> RunDashboardAsync()
+    {
+        if (Console.IsInputRedirected)
+        {
+            AnsiConsole.MarkupLine("[yellow]The interactive dashboard needs a terminal. Run [cyan]sutra help[/] for commands.[/]");
+            return 2;
+        }
+        while (true)
+        {
+            var choice = AnsiConsole.Prompt(new SelectionPrompt<string>()
+                .Title("[cyan]SUTRA dashboard[/]")
+                .PageSize(8)
+                .AddChoices("Scan pipes", "Scan and save snapshot", "History", "Changes", "Recent activity", "Help", "Exit"));
+            switch (choice)
+            {
+                case "Scan pipes": await RunScanAsync([]); break;
+                case "Scan and save snapshot": await RunScanAsync(["--snapshot"]); break;
+                case "History": RunHistory([]); break;
+                case "Changes": RunChanges([]); break;
+                case "Recent activity": RunActivity([]); break;
+                case "Help": ShowHelp(); break;
+                default: return 0;
+            }
+            AnsiConsole.WriteLine();
+        }
+    }
+
     private static bool RequireWindows()
     {
         if (OperatingSystem.IsWindows()) return true;
@@ -251,6 +367,82 @@ public static class SutraApp
     {
         value = defaultValue;
         return !options.TryGetValue(key, out var raw) || (int.TryParse(raw, out value) && value >= minimum && value <= maximum);
+    }
+
+    private static bool TryGetFormat(IReadOnlyDictionary<string, string?> options, out ReportFormat format, out string? error)
+    {
+        error = null;
+        var value = options.TryGetValue("--format", out var raw) ? raw : "table";
+        if (Enum.TryParse(value, true, out format) && Enum.IsDefined(format)) return true;
+        error = "--format must be table, ascii, json, or dot.";
+        return false;
+    }
+
+    private static bool TryBuildFilter(IReadOnlyDictionary<string, string?> options, out EndpointReportFilter filter, out string? error)
+    {
+        error = null;
+        var sortValue = options.TryGetValue("--sort", out var sortRaw) ? sortRaw : "name";
+        if (!Enum.TryParse<ReportSort>(sortValue, true, out var sort))
+        { filter = new EndpointReportFilter(); error = "--sort must be name, pid, or severity."; return false; }
+        var orderValue = options.TryGetValue("--order", out var orderRaw) ? orderRaw : "asc";
+        if (!Enum.TryParse<ReportOrder>(orderValue, true, out var order))
+        { filter = new EndpointReportFilter(); error = "--order must be asc or desc."; return false; }
+        bool? elevated = null;
+        if (options.TryGetValue("--elevated", out var elevatedRaw))
+        {
+            if (!bool.TryParse(elevatedRaw, out var isElevated))
+            { filter = new EndpointReportFilter(); error = "--elevated must be true or false."; return false; }
+            elevated = isElevated;
+        }
+        RiskSeverity? severity = null;
+        if (options.TryGetValue("--severity", out var severityRaw))
+        {
+            if (!Enum.TryParse<RiskSeverity>(severityRaw, true, out var parsedSeverity) || !Enum.IsDefined(parsedSeverity))
+            { filter = new EndpointReportFilter(); error = "--severity must be critical, high, medium, low, or informational."; return false; }
+            severity = parsedSeverity;
+        }
+        if (!TryGetIntOption(options, "--limit", 100_000, 1, 100_000, out var limit))
+        { filter = new EndpointReportFilter(); error = "--limit must be between 1 and 100000."; return false; }
+
+        filter = new EndpointReportFilter(
+            Value(options, "--scope"), Value(options, "--search"), Value(options, "--process"), Value(options, "--service"),
+            elevated, severity, sort, order, limit);
+        return true;
+    }
+
+    private static string? Value(IReadOnlyDictionary<string, string?> options, string key) =>
+        options.TryGetValue(key, out var value) ? value : null;
+
+    private static string RenderFormat(ReportFormat format, ScanReportDocument report,
+        IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent> events) => format switch
+    {
+        ReportFormat.Json => ScanReportFormatter.ToJson(report),
+        ReportFormat.Dot => ScanReportFormatter.ToDot(endpoints, events),
+        ReportFormat.Ascii => ScanReportFormatter.ToAscii(endpoints, events),
+        _ => ScanReportFormatter.ToPlainText(report)
+    };
+
+    private static void WriteReportFile(string path, string contents)
+    {
+        var fullPath = Path.GetFullPath(path);
+        Directory.CreateDirectory(Path.GetDirectoryName(fullPath)!);
+        File.WriteAllText(fullPath, contents, new UTF8Encoding(encoderShouldEmitUTF8Identifier: false));
+    }
+
+    private static IReadOnlyList<SysmonPipeEvent> ReadEventsForEndpoints(IReadOnlyList<PipeEndpoint> endpoints, string databasePath)
+    {
+        if (endpoints.Count == 0 || !File.Exists(databasePath)) return Array.Empty<SysmonPipeEvent>();
+        try
+        {
+            var names = new HashSet<string>(endpoints.Select(endpoint => endpoint.Name), StringComparer.OrdinalIgnoreCase);
+            return new SqliteHistoryStore(databasePath).GetRecentEvents(500)
+                .Where(item => item.IsCorrelated && names.Contains(item.PipeName)).ToArray();
+        }
+        catch (Microsoft.Data.Sqlite.SqliteException ex)
+        {
+            Console.Error.WriteLine($"Unable to read cached activity for report: {ex.Message}");
+            return Array.Empty<SysmonPipeEvent>();
+        }
     }
 
     private static string GetDatabasePath(IReadOnlyDictionary<string, string?> options) =>
@@ -293,11 +485,23 @@ public static class SutraApp
     }
 
     [SupportedOSPlatform("windows")]
-    private static async Task<IReadOnlyList<PipeEndpoint>> InspectSecurityWindowsAsync(IReadOnlyList<PipeEndpoint> endpoints)
+    private static async Task<IReadOnlyList<PipeEndpoint>> InspectSecurityWindowsAsync(IReadOnlyList<PipeEndpoint> endpoints, bool showProgress)
     {
         if (endpoints.Count == 0) return endpoints;
         var inspector = new PipeSecurityInspector();
         var analyzer = new PipeRiskAnalyzer();
+        if (!showProgress)
+        {
+            var directResults = new List<PipeEndpoint>(endpoints.Count);
+            foreach (var endpoint in endpoints)
+            {
+                var inspected = inspector.Inspect(endpoint);
+                directResults.Add(inspected.SecurityStatus == "Inspected"
+                    ? inspected with { Findings = analyzer.Analyze(inspected) }
+                    : inspected);
+            }
+            return directResults;
+        }
         return await AnsiConsole.Progress()
             .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new SpinnerColumn())
             .StartAsync(context =>
@@ -337,7 +541,12 @@ public static class SutraApp
         table.AddRow("[white]sutra events[/]", "Ingest and correlate Sysmon pipe events 17 and 18.");
         table.AddRow("[white]sutra events --since-hours 48[/]", "Set the event lookback window (1–720 hours).");
         table.AddRow("[white]sutra activity[/]", "Show the saved Sysmon pipe event timeline.");
+        table.AddRow("[white]sutra report[/]", "Render the latest saved snapshot or export a report.");
+        table.AddRow("[white]sutra dashboard[/]", "Open the interactive terminal menu.");
         table.AddRow("[white]--db <path>[/]", "Select the SQLite database file for history and events.");
+        table.AddRow("[white]--format table|ascii|json|dot[/]", "Choose a terminal view or report format for scan/report.");
+        table.AddRow("[white]--search <text> --sort <field>[/]", "Search and order endpoint results.");
+        table.AddRow("[white]--output <path>[/]", "Write the selected report format to a file.");
         table.AddRow("[white]sutra help[/]", "Show this help.");
         AnsiConsole.Write(table);
         AnsiConsole.MarkupLine("[grey]Inspection opens each pipe and may briefly connect to its server. This can trigger server connection handling; use only when acceptable.[/]");

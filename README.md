@@ -58,7 +58,25 @@ Review snapshots, compare the latest pair, ingest Sysmon pipe events, or view th
 & .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe activity
 ```
 
-Use `--db <path>` with snapshot, history, changes, events, or activity commands to select a database other than the default `%LOCALAPPDATA%\Sutra\sutra.db`.
+Open the interactive menu or export a report from the latest saved snapshot:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe dashboard
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe report --format json --output .\sutra-report.json
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe report --format dot --output .\sutra-relationships.dot
+```
+
+Choose `table`, `ascii`, `json`, or `dot` with `--format`. `scan` and `report` accept `--output <path>`; JSON contains scan metadata, severity totals, observed events, endpoint security information, and findings. DOT exports process, service, pipe, and correlated event relationships when that metadata is available.
+
+Filter and order scan results with `--scope <pipe-name-prefix>`, `--search <text>`, `--process <name>`, `--service <name>`, `--elevated true|false`, `--severity <level>`, `--sort name|pid|severity`, `--order asc|desc`, and `--limit <count>`. For example:
+
+```powershell
+& .\src\Sutra.Cli\bin\Release\net10.0\win-x64\publish\sutra.exe scan --inspect-acl --severity high --sort severity --order desc --format json --output .\high-risk.json
+```
+
+Use `--db <path>` with snapshot capture, scan or snapshot reports, history, changes, events, or activity commands to select a database other than the default `%LOCALAPPDATA%\Sutra\sutra.db`.
+
+For `scan`, `--snapshot` saves the complete discovered inventory before display filters are applied. A report can filter that snapshot without changing the stored baseline. `report --snapshot <id>` exports a specific saved snapshot; `latest` is the default.
 
 Show command help:
 
@@ -93,7 +111,3 @@ Findings are indicators for review, not proof of exploitability. The current ana
 dotnet build .\Sutra.slnx -c Release
 dotnet test .\Sutra.slnx -c Release
 ```
-
-## License
-
-No license has been specified yet.

@@ -86,6 +86,27 @@ public sealed class SqliteHistoryStore
         return snapshots;
     }
 
+    public IReadOnlyList<PipeEndpoint> GetSnapshotEndpoints(string snapshotId)
+    {
+        using var connection = Open();
+        var snapshot = snapshotId.Equals("latest", StringComparison.OrdinalIgnoreCase)
+            ? GetLatestTwo(connection).FirstOrDefault()
+            : ReadSnapshot(connection, snapshotId);
+        if (snapshot is null) return Array.Empty<PipeEndpoint>();
+        var rows = ReadEndpoints(connection, null, snapshot.Id);
+        return rows.OrderBy(pair => pair.Key, StringComparer.OrdinalIgnoreCase)
+            .Select(pair => JsonSerializer.Deserialize<PipeEndpoint>(pair.Value.Json))
+            .Where(endpoint => endpoint is not null).Cast<PipeEndpoint>().ToArray();
+    }
+
+    public ScanSnapshot? GetSnapshot(string snapshotId)
+    {
+        using var connection = Open();
+        return snapshotId.Equals("latest", StringComparison.OrdinalIgnoreCase)
+            ? GetLatestTwo(connection).FirstOrDefault()
+            : ReadSnapshot(connection, snapshotId);
+    }
+
     public IReadOnlyList<EndpointChange>? GetLatestChanges()
     {
         using var connection = Open();
@@ -217,6 +238,15 @@ public sealed class SqliteHistoryStore
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
         command.CommandText = "SELECT Id, CapturedUtc, EndpointCount FROM Snapshots ORDER BY CapturedUtc DESC, rowid DESC LIMIT 1";
+        using var reader = command.ExecuteReader();
+        return reader.Read() ? new ScanSnapshot(reader.GetString(0), DateTimeOffset.Parse(reader.GetString(1)), reader.GetInt32(2)) : null;
+    }
+
+    private static ScanSnapshot? ReadSnapshot(SqliteConnection connection, string snapshotId)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT Id, CapturedUtc, EndpointCount FROM Snapshots WHERE Id = $id";
+        command.Parameters.AddWithValue("$id", snapshotId);
         using var reader = command.ExecuteReader();
         return reader.Read() ? new ScanSnapshot(reader.GetString(0), DateTimeOffset.Parse(reader.GetString(1)), reader.GetInt32(2)) : null;
     }
