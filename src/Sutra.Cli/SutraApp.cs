@@ -1,5 +1,6 @@
 using Spectre.Console;
 using System.Runtime.Versioning;
+using Sutra.Cli.Analysis;
 using Sutra.Cli.Models;
 using Sutra.Cli.Native;
 
@@ -31,7 +32,7 @@ public static class SutraApp
         }
         if (!OperatingSystem.IsWindows())
         {
-            AnsiConsole.MarkupLine("[red]SUTRA Stage 1 requires Windows.[/]");
+            AnsiConsole.MarkupLine("[red]SUTRA requires Windows.[/]");
             return 2;
         }
 
@@ -52,25 +53,40 @@ public static class SutraApp
             return 1;
         }
 
-        var inspected = inspectAcl ? InspectSecurityWindows(endpoints) : endpoints;
+        var inspected = inspectAcl ? await InspectSecurityWindowsAsync(endpoints) : endpoints;
         RenderResults(inspected, inspectAcl);
         return 0;
     }
 
     [SupportedOSPlatform("windows")]
-    private static IReadOnlyList<PipeEndpoint> InspectSecurityWindows(IReadOnlyList<PipeEndpoint> endpoints)
+    private static async Task<IReadOnlyList<PipeEndpoint>> InspectSecurityWindowsAsync(IReadOnlyList<PipeEndpoint> endpoints)
     {
+        if (endpoints.Count == 0) return endpoints;
         var inspector = new PipeSecurityInspector();
-        var results = new List<PipeEndpoint>(endpoints.Count);
-        foreach (var endpoint in endpoints) results.Add(inspector.Inspect(endpoint));
-        return results;
+        var analyzer = new PipeRiskAnalyzer();
+        return await AnsiConsole.Progress()
+            .Columns(new TaskDescriptionColumn(), new ProgressBarColumn(), new PercentageColumn(), new SpinnerColumn())
+            .StartAsync(context =>
+        {
+            var task = context.AddTask("Inspecting permissions and process context", maxValue: endpoints.Count);
+            var results = new List<PipeEndpoint>(endpoints.Count);
+            foreach (var endpoint in endpoints)
+            {
+                var inspected = inspector.Inspect(endpoint);
+                results.Add(inspected.SecurityStatus == "Inspected"
+                    ? inspected with { Findings = analyzer.Analyze(inspected) }
+                    : inspected);
+                task.Increment(1);
+            }
+            return Task.FromResult<IReadOnlyList<PipeEndpoint>>(results);
+        });
     }
 
     private static void ShowBanner()
     {
         var art = new FigletText("SUTRA").Color(Color.Cyan1);
         AnsiConsole.Write(Align.Center(art));
-        AnsiConsole.Write(Align.Center(new Markup("[grey]Windows IPC Attack Surface Mapper · Stage 1[/]")));
+        AnsiConsole.Write(Align.Center(new Markup("[grey]Windows IPC Attack Surface Mapper[/]")));
         AnsiConsole.WriteLine();
     }
 
@@ -80,11 +96,11 @@ public static class SutraApp
         table.AddColumn(new TableColumn("[cyan]Command[/]"));
         table.AddColumn(new TableColumn("[cyan]Description[/]"));
         table.AddRow("[white]sutra scan[/]", "Discover named pipes without connecting to endpoints.");
-        table.AddRow("[white]sutra scan --inspect-acl[/]", "Request owner and DACL metadata for discovered endpoints.");
+        table.AddRow("[white]sutra scan --inspect-acl[/]", "Inspect ACLs, server process context, services, and permissions.");
         table.AddRow("[white]sutra help[/]", "Show this help.");
         AnsiConsole.Write(table);
-        AnsiConsole.MarkupLine("[grey]ACL inspection opens pipe names through the Windows security API and may briefly connect to an available server. Use only when that side effect is acceptable.[/]");
-        AnsiConsole.MarkupLine("[grey]Server process IDs are not queried; the available named-pipe API requires connecting to the endpoint.[/]");
+        AnsiConsole.MarkupLine("[grey]Inspection opens each pipe and may briefly connect to its server. This can trigger server connection handling; use only when acceptable.[/]");
+        AnsiConsole.MarkupLine("[grey]Permission findings are contextual indicators. They do not prove exploitability or evaluate effective access across all ACEs.[/]");
     }
 
     private static void RenderResults(IReadOnlyList<PipeEndpoint> endpoints, bool aclRequested)
@@ -97,6 +113,7 @@ public static class SutraApp
             table.AddColumn("ACL");
             table.AddColumn("Owner SID");
             table.AddColumn("ACEs");
+            table.AddColumn("PID");
         }
         table.AddColumn("PID");
 
@@ -116,7 +133,13 @@ public static class SutraApp
         AnsiConsole.Write(table);
         AnsiConsole.WriteLine();
         var inspectedCount = endpoints.Count(e => e.SecurityStatus == "Inspected");
-        AnsiConsole.MarkupLine($"[cyan]Scan summary[/]  endpoints [white]{endpoints.Count}[/]  ·  security descriptors [white]{inspectedCount}[/]/{(aclRequested ? endpoints.Count : 0)}  ·  process IDs [grey]not queried[/]");
+        AnsiConsole.MarkupLine($"[cyan]Scan summary[/]  endpoints [white]{endpoints.Count}[/]  ·  security descriptors [white]{inspectedCount}[/]/{(aclRequested ? endpoints.Count : 0)}  ·  process contexts [white]{endpoints.Count(e => e.ServerProcessId.HasValue)}[/]");
+        if (aclRequested)
+        {
+            var allFindings = endpoints.SelectMany(e => e.Findings ?? Array.Empty<RiskFinding>()).ToArray();
+            var counters = Enum.GetValues<RiskSeverity>().Select(severity => $"{severity} [white]{allFindings.Count(f => f.Severity == severity)}[/]");
+            AnsiConsole.MarkupLine("[cyan]Risk summary[/]  " + string.Join("  ·  ", counters));
+        }
 
         if (aclRequested)
         {
@@ -124,13 +147,22 @@ public static class SutraApp
             foreach (var endpoint in aclRows)
             {
                 AnsiConsole.WriteLine();
-                AnsiConsole.MarkupLine($"[cyan]{Markup.Escape(endpoint.Name)}[/] [grey]· owner {Markup.Escape(endpoint.OwnerSid ?? "—")}[/]");
+                AnsiConsole.MarkupLine($"[cyan]{Markup.Escape(endpoint.Name)}[/] [grey]· owner {Markup.Escape(endpoint.OwnerSid ?? "—")} · DACL {Markup.Escape(endpoint.DaclState ?? "unknown")}[/]");
+                var context = $"[white]Process:[/] {Markup.Escape(endpoint.ProcessName ?? "unavailable")} (PID {endpoint.ServerProcessId?.ToString() ?? "—"}) · [white]User SID:[/] {Markup.Escape(endpoint.ProcessUserSid ?? "unavailable")} · [white]Elevated:[/] {endpoint.ProcessIsElevated?.ToString() ?? "unknown"} · [white]Services:[/] {Markup.Escape(endpoint.ServiceNames is { Count: > 0 } ? string.Join(", ", endpoint.ServiceNames) : "none identified")}";
+                AnsiConsole.MarkupLine(context);
                 var aceTable = new Table().Border(TableBorder.Simple);
                 aceTable.AddColumn("Type"); aceTable.AddColumn("Trustee SID"); aceTable.AddColumn("Mask"); aceTable.AddColumn("Flags");
                 foreach (var ace in endpoint.AccessEntries!)
                     aceTable.AddRow(ace.Type, ace.Sid, ace.Rights, ace.Flags);
-                if (endpoint.AccessEntries!.Count == 0) aceTable.AddRow("—", "No DACL entries returned", "—", "—");
+                if (endpoint.AccessEntries!.Count == 0)
+                {
+                    var emptyMessage = endpoint.DaclState is "Null DACL" or "DACL absent"
+                        ? "No DACL restriction is present"
+                        : endpoint.DaclState == "Present" ? "Empty DACL; no ACEs" : "No DACL entries returned";
+                    aceTable.AddRow("—", emptyMessage, "—", "—");
+                }
                 AnsiConsole.Write(aceTable);
+                RenderFindings(endpoint);
             }
         }
 
@@ -143,6 +175,32 @@ public static class SutraApp
             AnsiConsole.Write(panel);
             if (endpoints.Count(e => e.SecurityStatus == "Unavailable") > unavailable.Length)
                 AnsiConsole.MarkupLine("[grey]Additional errors omitted.[/]");
+        }
+    }
+
+    private static void RenderFindings(PipeEndpoint endpoint)
+    {
+        if (endpoint.Findings is not { Count: > 0 } findings) return;
+        AnsiConsole.WriteLine();
+        var counts = Enum.GetValues<RiskSeverity>().Select(severity => $"{severity}: {findings.Count(f => f.Severity == severity)}");
+        AnsiConsole.MarkupLine("[cyan]Permission analysis[/]  " + Markup.Escape(string.Join(" · ", counts)));
+        foreach (var finding in findings)
+        {
+            var color = finding.Severity switch
+            {
+                RiskSeverity.Critical => "red bold",
+                RiskSeverity.High => "red",
+                RiskSeverity.Medium => "yellow",
+                RiskSeverity.Low => "blue",
+                _ => "grey"
+            };
+            var panelContent = $"{Markup.Escape(finding.Explanation)}\n\n[white]Recommendation:[/] {Markup.Escape(finding.Recommendation)}";
+            AnsiConsole.Write(new Panel(panelContent)
+            {
+                Header = new PanelHeader($"[{color}]{finding.Severity}: {Markup.Escape(finding.Title)}[/]"),
+                Border = BoxBorder.Rounded,
+                BorderStyle = new Style(finding.Severity is RiskSeverity.High or RiskSeverity.Critical ? Color.Red : Color.Grey)
+            });
         }
     }
 
