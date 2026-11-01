@@ -2,6 +2,8 @@
 
 Windows IPC attack surface mapper for named pipes, RPC, COM, and ALPC.
 
+![SUTRA scan output](sutra-image.png)
+
 ## Install
 
 Requires Windows 10 or later and the .NET 10 SDK.
