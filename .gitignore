@@ -1,0 +1,28 @@
+# .NET build output
+**/bin/
+**/obj/
+**/TestResults/
+*.user
+*.suo
+
+# IDE and local workspace state
+.vs/
+.vscode/
+.idea/
+
+# Local configuration and credentials
+.env
+.env.*
+!.env.example
+*.pfx
+*.p12
+*.key
+secrets.json
+appsettings.Local.json
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+Thumbs.db
+Desktop.ini

@@ -1,0 +1,8 @@
+<Solution>
+  <Folder Name="/src/">
+    <Project Path="src/Sutra.Cli/Sutra.Cli.csproj" />
+  </Folder>
+  <Folder Name="/tests/">
+    <Project Path="tests/Sutra.Tests/Sutra.Tests.csproj" />
+  </Folder>
+</Solution>
