@@ -85,7 +85,7 @@ public static class SutraApp
         if (terminalOutput)
         {
             ShowBanner();
-            var scanDescription = saveSnapshot ? "IPC inventory · snapshot capture" : "IPC inventory · read-only scan";
+            var scanDescription = saveSnapshot ? "IPC and sensitive-handle inventory · snapshot capture" : "IPC and sensitive-handle investigation";
             AnsiConsole.MarkupLine($"[grey]{scanDescription}[/]");
             AnsiConsole.WriteLine();
         }
@@ -110,6 +110,17 @@ public static class SutraApp
             return 1;
         }
 
+        var sensitiveHandles = terminalOutput
+            ? await AnsiConsole.Status().Spinner(Spinner.Known.Dots).SpinnerStyle(Style.Parse("cyan"))
+                .StartAsync("Reviewing sensitive process handles…", _ => Task.FromResult(SensitiveHandleScanner.Scan()))
+            : SensitiveHandleScanner.Scan();
+        if (sensitiveHandles.Error is not null)
+        {
+            var message = $"Sensitive handle inspection unavailable: {sensitiveHandles.Error}";
+            if (terminalOutput) AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(message)}[/]");
+            else Console.Error.WriteLine(message);
+        }
+
         var inspected = inspectAcl ? await InspectSecurityWindowsAsync(endpoints, terminalOutput) : endpoints;
         foreach (var result in discoveryResults.Where(result => result.Error is not null))
         {
@@ -124,7 +135,7 @@ public static class SutraApp
         {
             try
             {
-                snapshotResult = new SqliteHistoryStore(GetDatabasePath(options)).SaveSnapshot(inspected);
+                snapshotResult = new SqliteHistoryStore(GetDatabasePath(options)).SaveSnapshot(inspected, sensitiveHandles);
             }
             catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException)
             {
@@ -138,12 +149,12 @@ public static class SutraApp
             .Select(endpoint => endpoint.Name), StringComparer.OrdinalIgnoreCase);
         var recentEvents = existingEvents.Where(item => selectedNames.Contains(item.PipeName)).ToArray();
         var source = snapshotResult is null ? "Live scan" : $"Snapshot {snapshotResult.Snapshot.Id}";
-        var report = ScanReportFormatter.CreateDocument(selected, source, recentEvents, discoveryResults);
+        var report = ScanReportFormatter.CreateDocument(selected, source, recentEvents, discoveryResults, sensitiveHandles);
         if (options.TryGetValue("--output", out var outputPath))
         {
             try
             {
-                WriteReportFile(outputPath!, RenderFormat(format, report, selected, recentEvents));
+                WriteReportFile(outputPath!, RenderFormat(format, report, selected, recentEvents, sensitiveHandles));
                 AnsiConsole.MarkupLine($"[green]Report written:[/] {Markup.Escape(Path.GetFullPath(outputPath!))}");
             }
             catch (Exception ex) when (ex is IOException or UnauthorizedAccessException or ArgumentException)
@@ -152,8 +163,8 @@ public static class SutraApp
                 return 1;
             }
         }
-        else if (terminalOutput) RenderResults(selected, inspectAcl, discoveryResults);
-        else Console.Write(RenderFormat(format, report, selected, recentEvents));
+        else if (terminalOutput) RenderResults(selected, inspectAcl, discoveryResults, sensitiveHandles);
+        else Console.Write(RenderFormat(format, report, selected, recentEvents, sensitiveHandles));
 
         if (snapshotResult is not null)
         {
@@ -316,15 +327,17 @@ public static class SutraApp
             }
             var endpoints = ScanReportFormatter.FilterAndSort(store.GetSnapshotEndpoints(snapshot.Id), filter);
             var events = ReadEventsForEndpoints(endpoints, GetDatabasePath(options));
-            var report = ScanReportFormatter.CreateDocument(endpoints, $"Snapshot {snapshot.Id}", events);
+            var sensitiveHandles = store.GetSnapshotSensitiveHandles(snapshot.Id);
+            var report = ScanReportFormatter.CreateDocument(endpoints, $"Snapshot {snapshot.Id}", events,
+                sensitiveHandles: sensitiveHandles);
             if (options.TryGetValue("--output", out var outputPath))
             {
-                WriteReportFile(outputPath!, RenderFormat(format, report, endpoints, events));
+                WriteReportFile(outputPath!, RenderFormat(format, report, endpoints, events, sensitiveHandles));
                 AnsiConsole.MarkupLine($"[green]Report written:[/] {Markup.Escape(Path.GetFullPath(outputPath!))}");
             }
             else if (format == ReportFormat.Table)
-                RenderResults(endpoints, endpoints.Any(endpoint => endpoint.SecurityStatus == "Inspected"));
-            else Console.Write(RenderFormat(format, report, endpoints, events));
+                RenderResults(endpoints, endpoints.Any(endpoint => endpoint.SecurityStatus == "Inspected"), sensitiveHandles: sensitiveHandles);
+            else Console.Write(RenderFormat(format, report, endpoints, events, sensitiveHandles));
             return 0;
         }
         catch (Exception ex) when (ex is Microsoft.Data.Sqlite.SqliteException or IOException or UnauthorizedAccessException or ArgumentException)
@@ -488,11 +501,12 @@ public static class SutraApp
         options.TryGetValue(key, out var value) ? value : null;
 
     private static string RenderFormat(ReportFormat format, ScanReportDocument report,
-        IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent> events) => format switch
+        IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent> events,
+        SensitiveHandleScanResult? sensitiveHandles = null) => format switch
     {
         ReportFormat.Json => ScanReportFormatter.ToJson(report),
-        ReportFormat.Dot => ScanReportFormatter.ToDot(endpoints, events),
-        ReportFormat.Ascii => ScanReportFormatter.ToAscii(endpoints, events),
+        ReportFormat.Dot => ScanReportFormatter.ToDot(endpoints, events, sensitiveHandles),
+        ReportFormat.Ascii => ScanReportFormatter.ToAscii(endpoints, events, sensitiveHandles),
         _ => ScanReportFormatter.ToPlainText(report)
     };
 
@@ -605,7 +619,7 @@ public static class SutraApp
     {
         var art = new FigletText("SUTRA").Color(Color.Cyan1);
         AnsiConsole.Write(Align.Center(art));
-        AnsiConsole.Write(Align.Center(new Markup("[grey]Windows IPC Attack Surface Mapper[/]")));
+        AnsiConsole.Write(Align.Center(new Markup("[grey]Windows IPC and Sensitive Handle Mapper[/]")));
         AnsiConsole.WriteLine();
     }
 
@@ -614,10 +628,10 @@ public static class SutraApp
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey35);
         table.AddColumn(new TableColumn("[cyan]Command[/]"));
         table.AddColumn(new TableColumn("[cyan]Description[/]"));
-        table.AddRow("[white]sutra scan[/]", "Discover named pipes, RPC endpoints, COM registrations, and visible ALPC ports.");
-        table.AddRow("[white]sutra scan --inspect-acl[/]", "Inspect named-pipe ACLs, server process context, services, and permissions.");
+        table.AddRow("[white]sutra scan[/]", "Inventory IPC and investigate handles to LSASS, browsers, tokens, and critical files.");
+        table.AddRow("[white]sutra scan --inspect-acl[/]", "Also inspect named-pipe ACLs, process context, services, and permissions.");
         table.AddRow("[white]sutra scan --mechanisms named-pipe,rpc[/]", "Select one or more IPC discovery modules.");
-        table.AddRow("[white]sutra scan --snapshot[/]", "Save endpoint metadata and compare it with the prior snapshot.");
+        table.AddRow("[white]sutra scan --snapshot[/]", "Save IPC and sensitive-handle findings for later reports.");
         table.AddRow("[white]sutra history[/]", "List saved scan snapshots.");
         table.AddRow("[white]sutra changes[/]", "Compare the two most recent snapshots.");
         table.AddRow("[white]sutra events[/]", "Ingest and correlate Sysmon pipe events 17 and 18.");
@@ -635,11 +649,13 @@ public static class SutraApp
         AnsiConsole.Write(table);
         AnsiConsole.MarkupLine("[grey]ACL inspection opens named pipes and may briefly connect to their servers. This can trigger server connection handling.[/]");
         AnsiConsole.MarkupLine("[grey]RPC, COM, and ALPC results are registration or name inventories. They do not identify every live server process. ALPC coverage is best effort.[/]");
+        AnsiConsole.MarkupLine("[grey]Sensitive handle findings are best effort and limited by process access; SUTRA does not enable debug privileges.[/]");
         AnsiConsole.MarkupLine("[grey]Permission findings are contextual indicators. They do not prove exploitability or evaluate effective access across all ACEs.[/]");
         AnsiConsole.MarkupLine("[grey]Sysmon correlation requires Sysmon and readable Event ID 17/18 records in Microsoft-Windows-Sysmon/Operational.[/]");
     }
 
-    private static void RenderResults(IReadOnlyList<PipeEndpoint> endpoints, bool aclRequested, IReadOnlyList<DiscoveryResult>? discoveryResults = null)
+    private static void RenderResults(IReadOnlyList<PipeEndpoint> endpoints, bool aclRequested,
+        IReadOnlyList<DiscoveryResult>? discoveryResults = null, SensitiveHandleScanResult? sensitiveHandles = null)
     {
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey35);
         table.AddColumn("Mechanism");
@@ -731,6 +747,27 @@ public static class SutraApp
             if (endpoints.Count(e => e.SecurityStatus == "Unavailable") > unavailable.Length)
                 AnsiConsole.MarkupLine("[grey]Additional errors omitted.[/]");
         }
+        RenderSensitiveHandles(sensitiveHandles);
+    }
+
+    private static void RenderSensitiveHandles(SensitiveHandleScanResult? scan)
+    {
+        if (scan is null) return;
+        AnsiConsole.WriteLine();
+        AnsiConsole.MarkupLine($"[cyan]Sensitive handle review[/]  findings [white]{scan.Findings.Count}[/]  · system handles [white]{scan.SystemHandleCount}[/]  · candidates [white]{scan.CandidateHandleCount}[/]  · inaccessible processes [white]{scan.InaccessibleProcessCount}[/]");
+        AnsiConsole.MarkupLine($"[grey]{Markup.Escape(scan.Error ?? scan.Coverage)}[/]");
+        if (scan.Findings.Count == 0)
+        {
+            AnsiConsole.MarkupLine("[grey]No matching sensitive handles were identified in the accessible handle set.[/]");
+            return;
+        }
+        var table = new Table().Border(TableBorder.Rounded);
+        table.AddColumn("Holder"); table.AddColumn("PID"); table.AddColumn("Object"); table.AddColumn("Target"); table.AddColumn("Handles"); table.AddColumn("Access");
+        foreach (var finding in scan.Findings)
+            table.AddRow(Markup.Escape(finding.HolderProcessName), finding.HolderProcessId.ToString(),
+                Markup.Escape(finding.ObjectCategory), Markup.Escape(Shorten(finding.Target, 70)),
+                finding.HandleCount.ToString(), $"0x{finding.GrantedAccess:X8} {Markup.Escape(finding.AccessRights)}");
+        AnsiConsole.Write(table);
     }
 
     private static void RenderFindings(PipeEndpoint endpoint)

@@ -28,7 +28,7 @@ public sealed class SqliteHistoryStore
 
     public string DatabasePath => _databasePath;
 
-    public SnapshotSaveResult SaveSnapshot(IReadOnlyList<PipeEndpoint> endpoints)
+    public SnapshotSaveResult SaveSnapshot(IReadOnlyList<PipeEndpoint> endpoints, SensitiveHandleScanResult? sensitiveHandles = null)
     {
         using var connection = Open();
         using var transaction = connection.BeginTransaction();
@@ -42,10 +42,12 @@ public sealed class SqliteHistoryStore
         using (var insertSnapshot = connection.CreateCommand())
         {
             insertSnapshot.Transaction = transaction;
-            insertSnapshot.CommandText = "INSERT INTO Snapshots (Id, CapturedUtc, EndpointCount) VALUES ($id, $utc, $count)";
+            insertSnapshot.CommandText = "INSERT INTO Snapshots (Id, CapturedUtc, EndpointCount, SensitiveHandlesJson) VALUES ($id, $utc, $count, $handles)";
             insertSnapshot.Parameters.AddWithValue("$id", id);
             insertSnapshot.Parameters.AddWithValue("$utc", captured.UtcDateTime.ToString("O"));
             insertSnapshot.Parameters.AddWithValue("$count", endpoints.Count);
+            insertSnapshot.Parameters.AddWithValue("$handles", sensitiveHandles is null
+                ? DBNull.Value : JsonSerializer.Serialize(sensitiveHandles));
             insertSnapshot.ExecuteNonQuery();
         }
 
@@ -53,8 +55,9 @@ public sealed class SqliteHistoryStore
         using (var insertEndpoint = connection.CreateCommand())
         {
             insertEndpoint.Transaction = transaction;
-            insertEndpoint.CommandText = "INSERT INTO SnapshotEndpoints (SnapshotId, Name, Fingerprint, EndpointJson) VALUES ($snapshot, $name, $fingerprint, $json)";
+            insertEndpoint.CommandText = "INSERT INTO SnapshotEndpoints (SnapshotId, Mechanism, Name, Fingerprint, EndpointJson) VALUES ($snapshot, $mechanism, $name, $fingerprint, $json)";
             var snapshotParameter = insertEndpoint.Parameters.Add("$snapshot", SqliteType.Text);
+            var mechanismParameter = insertEndpoint.Parameters.Add("$mechanism", SqliteType.Text);
             var nameParameter = insertEndpoint.Parameters.Add("$name", SqliteType.Text);
             var fingerprintParameter = insertEndpoint.Parameters.Add("$fingerprint", SqliteType.Text);
             var jsonParameter = insertEndpoint.Parameters.Add("$json", SqliteType.Text);
@@ -62,6 +65,7 @@ public sealed class SqliteHistoryStore
             {
                 var json = JsonSerializer.Serialize(endpoint);
                 snapshotParameter.Value = id;
+                mechanismParameter.Value = endpoint.IpcMechanism;
                 nameParameter.Value = endpoint.Name;
                 fingerprintParameter.Value = Fingerprint(json);
                 jsonParameter.Value = json;
@@ -107,6 +111,16 @@ public sealed class SqliteHistoryStore
             : ReadSnapshot(connection, snapshotId);
     }
 
+    public SensitiveHandleScanResult? GetSnapshotSensitiveHandles(string snapshotId)
+    {
+        using var connection = Open();
+        using var command = connection.CreateCommand();
+        command.CommandText = "SELECT SensitiveHandlesJson FROM Snapshots WHERE Id = $id";
+        command.Parameters.AddWithValue("$id", snapshotId);
+        var json = command.ExecuteScalar() as string;
+        return string.IsNullOrWhiteSpace(json) ? null : JsonSerializer.Deserialize<SensitiveHandleScanResult>(json);
+    }
+
     public IReadOnlyList<EndpointChange>? GetLatestChanges()
     {
         using var connection = Open();
@@ -117,11 +131,12 @@ public sealed class SqliteHistoryStore
         var changes = new List<EndpointChange>();
         foreach (var item in current)
         {
-            if (!previous.TryGetValue(item.Key, out var old)) changes.Add(new EndpointChange(EndpointChangeKind.Added, item.Key));
-            else if (!StringComparer.Ordinal.Equals(old.Fingerprint, item.Value.Fingerprint)) changes.Add(new EndpointChange(EndpointChangeKind.Modified, item.Key));
+            var displayName = DisplayEndpointIdentity(item.Key);
+            if (!previous.TryGetValue(item.Key, out var old)) changes.Add(new EndpointChange(EndpointChangeKind.Added, displayName));
+            else if (!StringComparer.Ordinal.Equals(old.Fingerprint, item.Value.Fingerprint)) changes.Add(new EndpointChange(EndpointChangeKind.Modified, displayName));
         }
         foreach (var item in previous)
-            if (!current.ContainsKey(item.Key)) changes.Add(new EndpointChange(EndpointChangeKind.Removed, item.Key));
+            if (!current.ContainsKey(item.Key)) changes.Add(new EndpointChange(EndpointChangeKind.Removed, DisplayEndpointIdentity(item.Key)));
         return changes.OrderBy(change => change.EndpointName, StringComparer.OrdinalIgnoreCase).ToArray();
     }
 
@@ -189,14 +204,16 @@ public sealed class SqliteHistoryStore
             CREATE TABLE IF NOT EXISTS Snapshots (
                 Id TEXT PRIMARY KEY,
                 CapturedUtc TEXT NOT NULL,
-                EndpointCount INTEGER NOT NULL
+                EndpointCount INTEGER NOT NULL,
+                SensitiveHandlesJson TEXT NULL
             );
             CREATE TABLE IF NOT EXISTS SnapshotEndpoints (
                 SnapshotId TEXT NOT NULL REFERENCES Snapshots(Id) ON DELETE CASCADE,
+                Mechanism TEXT NOT NULL,
                 Name TEXT NOT NULL COLLATE NOCASE,
                 Fingerprint TEXT NOT NULL,
                 EndpointJson TEXT NOT NULL,
-                PRIMARY KEY (SnapshotId, Name)
+                PRIMARY KEY (SnapshotId, Mechanism, Name)
             );
             CREATE TABLE IF NOT EXISTS SysmonEvents (
                 Channel TEXT NOT NULL,
@@ -214,6 +231,93 @@ public sealed class SqliteHistoryStore
             CREATE INDEX IF NOT EXISTS IX_SysmonEvents_TimeUtc ON SysmonEvents(TimeUtc);
             """;
         command.ExecuteNonQuery();
+        EnsureSensitiveHandlesColumn(connection);
+        EnsureSnapshotEndpointMechanismColumn(connection);
+    }
+
+    private static void EnsureSensitiveHandlesColumn(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA table_info(Snapshots)";
+        using var reader = command.ExecuteReader();
+        var hasColumn = false;
+        while (reader.Read())
+            if (reader.GetString(1).Equals("SensitiveHandlesJson", StringComparison.OrdinalIgnoreCase)) hasColumn = true;
+        reader.Close();
+        if (hasColumn) return;
+        using var alter = connection.CreateCommand();
+        alter.CommandText = "ALTER TABLE Snapshots ADD COLUMN SensitiveHandlesJson TEXT NULL";
+        alter.ExecuteNonQuery();
+    }
+
+    private static void EnsureSnapshotEndpointMechanismColumn(SqliteConnection connection)
+    {
+        using var command = connection.CreateCommand();
+        command.CommandText = "PRAGMA table_info(SnapshotEndpoints)";
+        using var reader = command.ExecuteReader();
+        var hasColumn = false;
+        while (reader.Read())
+            if (reader.GetString(1).Equals("Mechanism", StringComparison.OrdinalIgnoreCase)) hasColumn = true;
+        reader.Close();
+        if (hasColumn) return;
+
+        using var transaction = connection.BeginTransaction();
+        using (var rename = connection.CreateCommand())
+        {
+            rename.Transaction = transaction;
+            rename.CommandText = "ALTER TABLE SnapshotEndpoints RENAME TO SnapshotEndpoints_Legacy";
+            rename.ExecuteNonQuery();
+        }
+        using (var create = connection.CreateCommand())
+        {
+            create.Transaction = transaction;
+            create.CommandText = """
+                CREATE TABLE SnapshotEndpoints (
+                    SnapshotId TEXT NOT NULL REFERENCES Snapshots(Id) ON DELETE CASCADE,
+                    Mechanism TEXT NOT NULL,
+                    Name TEXT NOT NULL COLLATE NOCASE,
+                    Fingerprint TEXT NOT NULL,
+                    EndpointJson TEXT NOT NULL,
+                    PRIMARY KEY (SnapshotId, Mechanism, Name)
+                )
+                """;
+            create.ExecuteNonQuery();
+        }
+
+        var legacyRows = new List<(string Snapshot, string Name, string Fingerprint, string Json)>();
+        using (var select = connection.CreateCommand())
+        {
+            select.Transaction = transaction;
+            select.CommandText = "SELECT SnapshotId, Name, Fingerprint, EndpointJson FROM SnapshotEndpoints_Legacy";
+            using var rows = select.ExecuteReader();
+            while (rows.Read()) legacyRows.Add((rows.GetString(0), rows.GetString(1), rows.GetString(2), rows.GetString(3)));
+        }
+        using (var insert = connection.CreateCommand())
+        {
+            insert.Transaction = transaction;
+            insert.CommandText = "INSERT INTO SnapshotEndpoints (SnapshotId, Mechanism, Name, Fingerprint, EndpointJson) VALUES ($snapshot, $mechanism, $name, $fingerprint, $json)";
+            var snapshot = insert.Parameters.Add("$snapshot", SqliteType.Text);
+            var mechanism = insert.Parameters.Add("$mechanism", SqliteType.Text);
+            var name = insert.Parameters.Add("$name", SqliteType.Text);
+            var fingerprint = insert.Parameters.Add("$fingerprint", SqliteType.Text);
+            var json = insert.Parameters.Add("$json", SqliteType.Text);
+            foreach (var row in legacyRows)
+            {
+                snapshot.Value = row.Snapshot;
+                mechanism.Value = JsonSerializer.Deserialize<PipeEndpoint>(row.Json)?.IpcMechanism ?? "NamedPipe";
+                name.Value = row.Name;
+                fingerprint.Value = row.Fingerprint;
+                json.Value = row.Json;
+                insert.ExecuteNonQuery();
+            }
+        }
+        using (var drop = connection.CreateCommand())
+        {
+            drop.Transaction = transaction;
+            drop.CommandText = "DROP TABLE SnapshotEndpoints_Legacy";
+            drop.ExecuteNonQuery();
+        }
+        transaction.Commit();
     }
 
     private SqliteConnection Open()
@@ -255,11 +359,11 @@ public sealed class SqliteHistoryStore
     {
         using var command = connection.CreateCommand();
         command.Transaction = transaction;
-        command.CommandText = "SELECT Name, Fingerprint, EndpointJson FROM SnapshotEndpoints WHERE SnapshotId = $id";
+        command.CommandText = "SELECT Mechanism, Name, Fingerprint, EndpointJson FROM SnapshotEndpoints WHERE SnapshotId = $id";
         command.Parameters.AddWithValue("$id", snapshotId);
         using var reader = command.ExecuteReader();
         var endpoints = new Dictionary<string, (string, string)>(StringComparer.OrdinalIgnoreCase);
-        while (reader.Read()) endpoints[reader.GetString(0)] = (reader.GetString(1), reader.GetString(2));
+        while (reader.Read()) endpoints[EndpointIdentity(reader.GetString(0), reader.GetString(1))] = (reader.GetString(2), reader.GetString(3));
         return endpoints;
     }
 
@@ -268,16 +372,34 @@ public sealed class SqliteHistoryStore
         IReadOnlyList<PipeEndpoint> current)
     {
         var changes = new List<EndpointChange>();
-        var currentNames = new HashSet<string>(current.Select(endpoint => endpoint.Name), StringComparer.OrdinalIgnoreCase);
+        var currentNames = new HashSet<string>(current.Select(endpoint => EndpointIdentity(endpoint.IpcMechanism, endpoint.Name)), StringComparer.OrdinalIgnoreCase);
         foreach (var endpoint in current)
         {
-            if (!previous.TryGetValue(endpoint.Name, out var old)) changes.Add(new EndpointChange(EndpointChangeKind.Added, endpoint.Name));
+            var identity = EndpointIdentity(endpoint.IpcMechanism, endpoint.Name);
+            var displayName = DisplayEndpointName(endpoint.IpcMechanism, endpoint.Name);
+            if (!previous.TryGetValue(identity, out var old)) changes.Add(new EndpointChange(EndpointChangeKind.Added, displayName));
             else if (!StringComparer.Ordinal.Equals(old.Fingerprint, Fingerprint(JsonSerializer.Serialize(endpoint))))
-                changes.Add(new EndpointChange(EndpointChangeKind.Modified, endpoint.Name));
+                changes.Add(new EndpointChange(EndpointChangeKind.Modified, displayName));
         }
         foreach (var endpoint in previous.Keys)
-            if (!currentNames.Contains(endpoint)) changes.Add(new EndpointChange(EndpointChangeKind.Removed, endpoint));
+            if (!currentNames.Contains(endpoint))
+            {
+                var separator = endpoint.IndexOf('\0');
+                var mechanism = endpoint[..separator];
+                changes.Add(new EndpointChange(EndpointChangeKind.Removed, DisplayEndpointName(mechanism, endpoint[(separator + 1)..])));
+            }
         return changes.OrderBy(change => change.EndpointName, StringComparer.OrdinalIgnoreCase).ToArray();
+    }
+
+    private static string EndpointIdentity(string mechanism, string name) => mechanism + "\0" + name;
+
+    private static string DisplayEndpointName(string mechanism, string name) =>
+        mechanism.Equals("NamedPipe", StringComparison.OrdinalIgnoreCase) ? name : $"{mechanism}: {name}";
+
+    private static string DisplayEndpointIdentity(string identity)
+    {
+        var separator = identity.IndexOf('\0');
+        return DisplayEndpointName(identity[..separator], identity[(separator + 1)..]);
     }
 
     private static string Fingerprint(string json) => Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(json)));

@@ -27,6 +27,7 @@ public sealed record ScanReportDocument(
     IReadOnlyList<SysmonPipeEvent> ObservedEvents,
     IReadOnlyList<PipeEndpoint> Endpoints,
     IReadOnlyDictionary<string, int>? MechanismCounts = null,
-    IReadOnlyList<ModuleDiscoverySummary>? DiscoveryModules = null);
+    IReadOnlyList<ModuleDiscoverySummary>? DiscoveryModules = null,
+    Sutra.Cli.Models.SensitiveHandleScanResult? SensitiveHandles = null);
 
 public sealed record ModuleDiscoverySummary(string Mechanism, int EndpointCount, string? Error, string Coverage);

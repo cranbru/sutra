@@ -52,7 +52,8 @@ public static class ScanReportFormatter
     }
 
     public static ScanReportDocument CreateDocument(IReadOnlyList<PipeEndpoint> endpoints, string source,
-        IReadOnlyList<SysmonPipeEvent>? events = null, IReadOnlyList<DiscoveryResult>? discovery = null)
+        IReadOnlyList<SysmonPipeEvent>? events = null, IReadOnlyList<DiscoveryResult>? discovery = null,
+        SensitiveHandleScanResult? sensitiveHandles = null)
     {
         var counts = Enum.GetValues<RiskSeverity>().ToDictionary(
             severity => severity.ToString(),
@@ -61,7 +62,7 @@ public static class ScanReportFormatter
             .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
         var moduleSummaries = discovery?.Select(item => new ModuleDiscoverySummary(item.Mechanism, item.Endpoints.Count, item.Error, item.Coverage));
         return new ScanReportDocument("SUTRA", DateTimeOffset.UtcNow, source, endpoints.Count, counts,
-            events ?? Array.Empty<SysmonPipeEvent>(), endpoints, mechanisms, moduleSummaries?.ToArray());
+            events ?? Array.Empty<SysmonPipeEvent>(), endpoints, mechanisms, moduleSummaries?.ToArray(), sensitiveHandles);
     }
 
     public static string ToJson(ScanReportDocument report) => JsonSerializer.Serialize(report, JsonOptions);
@@ -85,10 +86,12 @@ public static class ScanReportFormatter
                 Clean(endpoint.ProcessName ?? "—"), Clean(endpoint.ServiceNames is { Count: > 0 } ? string.Join(", ", endpoint.ServiceNames) : "—"),
                 Clean(endpoint.DiscoveryDetails ?? "—"), Clean(findings)));
         }
+        AppendSensitiveHandles(output, report.SensitiveHandles);
         return output.ToString();
     }
 
-    public static string ToAscii(IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent>? observedEvents = null)
+    public static string ToAscii(IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent>? observedEvents = null,
+        SensitiveHandleScanResult? sensitiveHandles = null)
     {
         var output = new StringBuilder("SUTRA IPC RELATIONSHIPS\n");
         for (var i = 0; i < endpoints.Count; i++)
@@ -111,10 +114,12 @@ public static class ScanReportFormatter
             for (var relationIndex = 0; relationIndex < relations.Count; relationIndex++)
                 output.AppendLine($"{childPrefix}{(relationIndex == relations.Count - 1 ? "`-" : "+-")} {relations[relationIndex]}");
         }
+        AppendSensitiveHandles(output, sensitiveHandles);
         return output.ToString();
     }
 
-    public static string ToDot(IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent>? observedEvents = null)
+    public static string ToDot(IReadOnlyList<PipeEndpoint> endpoints, IReadOnlyList<SysmonPipeEvent>? observedEvents = null,
+        SensitiveHandleScanResult? sensitiveHandles = null)
     {
         var output = new StringBuilder();
         output.AppendLine("digraph SUTRA {");
@@ -162,8 +167,30 @@ public static class ScanReportFormatter
             output.AppendLine($"  {processId} [shape=ellipse, label=\"{EscapeDot(label)}\", fillcolor=\"#23314B\"];");
             output.AppendLine($"  {processId} -> {pipeId} [style=dashed, label=\"{EscapeDot(item.EventType)}\"];");
         }
+        foreach (var finding in sensitiveHandles?.Findings ?? Array.Empty<SensitiveHandleFinding>())
+        {
+            var holderId = NodeId("process", finding.HolderProcessId.ToString());
+            var targetId = NodeId("sensitive", finding.ObjectCategory + ":" + finding.Target);
+            var holderLabel = $"{finding.HolderProcessName}\\nPID {finding.HolderProcessId}";
+            var targetLabel = $"{finding.ObjectCategory}\\n{finding.Target}";
+            output.AppendLine($"  {holderId} [shape=ellipse, label=\"{EscapeDot(holderLabel)}\", fillcolor=\"#23314B\"];");
+            output.AppendLine($"  {targetId} [shape=box, label=\"{EscapeDot(targetLabel)}\", fillcolor=\"#4B2632\"];");
+            output.AppendLine($"  {holderId} -> {targetId} [color=\"#D98080\", label=\"{finding.HandleCount} handles / 0x{finding.GrantedAccess:X} {EscapeDot(finding.AccessRights)}\"];");
+        }
         output.AppendLine("}");
         return output.ToString();
+    }
+
+    private static void AppendSensitiveHandles(StringBuilder output, SensitiveHandleScanResult? scan)
+    {
+        if (scan is null) return;
+        output.AppendLine();
+        output.AppendLine($"SENSITIVE HANDLES\t{scan.Findings.Count} findings\t{scan.SystemHandleCount} system handles\t{scan.CandidateHandleCount} candidates\t{scan.InaccessibleProcessCount} inaccessible processes");
+        output.AppendLine("HOLDER PID\tPROCESS\tOBJECT\tTARGET\tHANDLES\tACCESS MASK\tRIGHTS");
+        foreach (var item in scan.Findings)
+            output.AppendLine(string.Join('\t', item.HolderProcessId.ToString(), Clean(item.HolderProcessName), Clean(item.ObjectCategory),
+                Clean(item.Target), item.HandleCount.ToString(), $"0x{item.GrantedAccess:X8}", Clean(item.AccessRights)));
+        output.AppendLine("Coverage: " + Clean(scan.Error ?? scan.Coverage));
     }
 
     public static string NodeId(string kind, string value)
