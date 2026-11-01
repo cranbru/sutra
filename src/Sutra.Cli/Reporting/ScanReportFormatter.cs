@@ -3,6 +3,7 @@ using System.Text;
 using System.Text.Json;
 using System.Text.Json.Serialization;
 using Sutra.Cli.Correlation;
+using Sutra.Cli.Discovery;
 using Sutra.Cli.Models;
 
 namespace Sutra.Cli.Reporting;
@@ -20,6 +21,8 @@ public static class ScanReportFormatter
         IEnumerable<PipeEndpoint> query = endpoints;
         if (!string.IsNullOrWhiteSpace(filter.ScopePrefix))
             query = query.Where(endpoint => endpoint.Name.StartsWith(filter.ScopePrefix, StringComparison.OrdinalIgnoreCase));
+        if (!string.IsNullOrWhiteSpace(filter.Mechanism))
+            query = query.Where(endpoint => endpoint.IpcMechanism.Equals(filter.Mechanism, StringComparison.OrdinalIgnoreCase));
         if (!string.IsNullOrWhiteSpace(filter.Search))
             query = query.Where(endpoint => Contains(endpoint.Name, filter.Search)
                 || Contains(endpoint.ProcessName, filter.Search)
@@ -49,13 +52,16 @@ public static class ScanReportFormatter
     }
 
     public static ScanReportDocument CreateDocument(IReadOnlyList<PipeEndpoint> endpoints, string source,
-        IReadOnlyList<SysmonPipeEvent>? events = null)
+        IReadOnlyList<SysmonPipeEvent>? events = null, IReadOnlyList<DiscoveryResult>? discovery = null)
     {
         var counts = Enum.GetValues<RiskSeverity>().ToDictionary(
             severity => severity.ToString(),
             severity => endpoints.Sum(endpoint => endpoint.Findings?.Count(finding => finding.Severity == severity) ?? 0));
+        var mechanisms = endpoints.GroupBy(endpoint => endpoint.IpcMechanism, StringComparer.OrdinalIgnoreCase)
+            .ToDictionary(group => group.Key, group => group.Count(), StringComparer.OrdinalIgnoreCase);
+        var moduleSummaries = discovery?.Select(item => new ModuleDiscoverySummary(item.Mechanism, item.Endpoints.Count, item.Error, item.Coverage));
         return new ScanReportDocument("SUTRA", DateTimeOffset.UtcNow, source, endpoints.Count, counts,
-            events ?? Array.Empty<SysmonPipeEvent>(), endpoints);
+            events ?? Array.Empty<SysmonPipeEvent>(), endpoints, mechanisms, moduleSummaries?.ToArray());
     }
 
     public static string ToJson(ScanReportDocument report) => JsonSerializer.Serialize(report, JsonOptions);
@@ -66,16 +72,18 @@ public static class ScanReportFormatter
         output.AppendLine($"SUTRA scan report · {report.GeneratedUtc:O}");
         output.AppendLine($"Source: {report.Source}");
         output.AppendLine($"Endpoints: {report.EndpointCount}");
+        output.AppendLine("Mechanisms: " + string.Join("  ", (report.MechanismCounts ?? new Dictionary<string, int>()).Select(item => $"{item.Key}={item.Value}")));
         output.AppendLine("Risk findings: " + string.Join("  ", report.SeverityCounts.Select(item => $"{item.Key}={item.Value}")));
         output.AppendLine();
-        output.AppendLine("NAME\tPID\tPROCESS\tSERVICES\tFINDINGS");
+        output.AppendLine("MECHANISM\tNAME\tPID\tPROCESS\tSERVICES\tDETAILS\tFINDINGS");
         foreach (var endpoint in report.Endpoints)
         {
             var findings = endpoint.Findings is { Count: > 0 }
                 ? string.Join(", ", endpoint.Findings.Select(finding => $"{finding.Severity}: {finding.Title}"))
                 : "—";
-            output.AppendLine(string.Join('\t', Clean(endpoint.Name), endpoint.ServerProcessId?.ToString() ?? "—",
-                Clean(endpoint.ProcessName ?? "—"), Clean(endpoint.ServiceNames is { Count: > 0 } ? string.Join(", ", endpoint.ServiceNames) : "—"), Clean(findings)));
+            output.AppendLine(string.Join('\t', Clean(endpoint.IpcMechanism), Clean(endpoint.Name), endpoint.ServerProcessId?.ToString() ?? "—",
+                Clean(endpoint.ProcessName ?? "—"), Clean(endpoint.ServiceNames is { Count: > 0 } ? string.Join(", ", endpoint.ServiceNames) : "—"),
+                Clean(endpoint.DiscoveryDetails ?? "—"), Clean(findings)));
         }
         return output.ToString();
     }
@@ -88,14 +96,17 @@ public static class ScanReportFormatter
             var endpoint = endpoints[i];
             var lastEndpoint = i == endpoints.Count - 1;
             var branch = lastEndpoint ? "`-" : "+-";
-            output.AppendLine($"{branch} PIPE {Clean(endpoint.Name)}");
+            output.AppendLine($"{branch} {Clean(endpoint.IpcMechanism.ToUpperInvariant())} {Clean(endpoint.Name)}");
             var childPrefix = lastEndpoint ? "   " : "|  ";
             var relations = new List<string>();
             if (endpoint.ServerProcessId.HasValue || endpoint.ProcessName is not null)
-                relations.Add($"SERVER {Clean(endpoint.ProcessName ?? "process")} (PID {endpoint.ServerProcessId?.ToString() ?? "—"}, {Clean(endpoint.ProcessUserSid ?? "identity unknown")})");
+                relations.Add($"{(endpoint.DiscoveryStatus == "Registered" ? "REGISTERED SERVER" : "SERVER")} {Clean(endpoint.ProcessName ?? "process")} (PID {endpoint.ServerProcessId?.ToString() ?? "—"}, {Clean(endpoint.ProcessUserSid ?? "identity unknown")})");
             relations.AddRange((endpoint.ServiceNames ?? Array.Empty<string>()).Select(service => $"SERVICE {Clean(service)}"));
+            if (!string.IsNullOrWhiteSpace(endpoint.DiscoveryDetails))
+                relations.Add($"DETAILS {Clean(endpoint.DiscoveryDetails)}");
             relations.AddRange((observedEvents ?? Array.Empty<SysmonPipeEvent>())
-                .Where(item => item.IsCorrelated && string.Equals(item.PipeName, endpoint.Name, StringComparison.OrdinalIgnoreCase))
+                .Where(item => endpoint.IpcMechanism == "NamedPipe" && item.IsCorrelated
+                    && string.Equals(item.PipeName, endpoint.Name, StringComparison.OrdinalIgnoreCase))
                 .Select(item => $"OBSERVED {Clean(item.EventType)} {Clean(item.ProcessName ?? "process")} (PID {item.ProcessId?.ToString() ?? "—"})"));
             for (var relationIndex = 0; relationIndex < relations.Count; relationIndex++)
                 output.AppendLine($"{childPrefix}{(relationIndex == relations.Count - 1 ? "`-" : "+-")} {relations[relationIndex]}");
@@ -112,11 +123,14 @@ public static class ScanReportFormatter
         output.AppendLine("  node [fontname=\"Segoe UI\", style=\"rounded,filled\", color=\"#36546D\", fillcolor=\"#142536\", fontcolor=\"#E7F1FA\"];");
         output.AppendLine("  edge [fontname=\"Segoe UI\", color=\"#7194B4\", fontcolor=\"#B8CBE0\"];");
 
-        var endpointNames = new HashSet<string>(endpoints.Select(endpoint => endpoint.Name), StringComparer.OrdinalIgnoreCase);
+        var endpointNames = new HashSet<string>(endpoints.Where(endpoint => endpoint.IpcMechanism == "NamedPipe")
+            .Select(endpoint => endpoint.Name), StringComparer.OrdinalIgnoreCase);
         foreach (var endpoint in endpoints)
         {
-            var pipeId = NodeId("pipe", endpoint.Name);
-            output.AppendLine($"  {pipeId} [shape=box, label=\"{EscapeDot("PIPE\n" + endpoint.Name)}\", fillcolor=\"#11364A\"];");
+            var ipcId = NodeId("ipc", endpoint.IpcMechanism + ":" + endpoint.Name);
+            var ipcLabel = endpoint.IpcMechanism.ToUpperInvariant() + "\n" + endpoint.Name;
+            if (!string.IsNullOrWhiteSpace(endpoint.DiscoveryDetails)) ipcLabel += "\n" + endpoint.DiscoveryDetails;
+            output.AppendLine($"  {ipcId} [shape=box, label=\"{EscapeDot(ipcLabel)}\", fillcolor=\"#11364A\"];");
             var processId = endpoint.ServerProcessId.HasValue
                 ? NodeId("process", endpoint.ServerProcessId.Value.ToString())
                 : endpoint.ProcessName is not null ? NodeId("process", endpoint.ProcessName) : null;
@@ -126,7 +140,8 @@ public static class ScanReportFormatter
                     ? $"{endpoint.ProcessName ?? "Process"}\nPID {endpoint.ServerProcessId}\n{endpoint.ProcessUserSid ?? "user unknown"}"
                     : endpoint.ProcessName!;
                 output.AppendLine($"  {processId} [shape=ellipse, label=\"{EscapeDot(processLabel)}\", fillcolor=\"#23314B\"];");
-                output.AppendLine($"  {processId} -> {pipeId} [label=\"serves\"];");
+                var processEdge = endpoint.DiscoveryStatus == "Registered" ? "registered server" : "serves";
+                output.AppendLine($"  {processId} -> {ipcId} [label=\"{processEdge}\"];");
             }
             foreach (var service in endpoint.ServiceNames ?? Array.Empty<string>())
             {
@@ -139,7 +154,7 @@ public static class ScanReportFormatter
         foreach (var item in observedEvents ?? Array.Empty<SysmonPipeEvent>())
         {
             if (!endpointNames.Contains(item.PipeName)) continue;
-            var pipeId = NodeId("pipe", item.PipeName);
+            var pipeId = NodeId("ipc", "NamedPipe:" + item.PipeName);
             if (!item.ProcessId.HasValue && item.ProcessName is null) continue;
             var clientKey = item.ProcessId?.ToString() ?? item.ProcessName!;
             var processId = NodeId("process", clientKey);

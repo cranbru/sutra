@@ -8,6 +8,7 @@ public enum ReportOrder { Asc, Desc }
 
 public sealed record EndpointReportFilter(
     string? ScopePrefix = null,
+    string? Mechanism = null,
     string? Search = null,
     string? Process = null,
     string? Service = null,
@@ -24,4 +25,8 @@ public sealed record ScanReportDocument(
     int EndpointCount,
     IReadOnlyDictionary<string, int> SeverityCounts,
     IReadOnlyList<SysmonPipeEvent> ObservedEvents,
-    IReadOnlyList<PipeEndpoint> Endpoints);
+    IReadOnlyList<PipeEndpoint> Endpoints,
+    IReadOnlyDictionary<string, int>? MechanismCounts = null,
+    IReadOnlyList<ModuleDiscoverySummary>? DiscoveryModules = null);
+
+public sealed record ModuleDiscoverySummary(string Mechanism, int EndpointCount, string? Error, string Coverage);

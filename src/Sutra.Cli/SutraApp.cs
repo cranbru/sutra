@@ -3,6 +3,7 @@ using System.Text;
 using System.Runtime.Versioning;
 using Sutra.Cli.Analysis;
 using Sutra.Cli.Correlation;
+using Sutra.Cli.Discovery;
 using Sutra.Cli.Models;
 using Sutra.Cli.Native;
 using Sutra.Cli.Reporting;
@@ -42,7 +43,7 @@ public static class SutraApp
 
     private static async Task<int> RunScanAsync(string[] args)
     {
-        string[] values = ["--db", "--format", "--output", "--scope", "--search", "--process", "--service", "--elevated", "--severity", "--sort", "--order", "--limit"];
+        string[] values = ["--db", "--format", "--output", "--scope", "--mechanism", "--mechanisms", "--search", "--process", "--service", "--elevated", "--severity", "--sort", "--order", "--limit"];
         if (!TryParseOptions(args, ["--inspect-acl", "--snapshot"], values, out var options, out var error))
         {
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
@@ -60,6 +61,11 @@ public static class SutraApp
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
             return 2;
         }
+        if (!TryGetMechanisms(options, out var mechanisms, out error))
+        {
+            AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
+            return 2;
+        }
         if (options.ContainsKey("--severity") && !inspectAcl)
         {
             AnsiConsole.MarkupLine("[red]--severity requires --inspect-acl.[/]");
@@ -71,25 +77,40 @@ public static class SutraApp
         if (terminalOutput)
         {
             ShowBanner();
-            var scanDescription = saveSnapshot ? "named-pipe inventory · snapshot capture" : "named-pipe inventory · read-only scan";
+            var scanDescription = saveSnapshot ? "IPC inventory · snapshot capture" : "IPC inventory · read-only scan";
             AnsiConsole.MarkupLine($"[grey]{scanDescription}[/]");
             AnsiConsole.WriteLine();
         }
         IReadOnlyList<PipeEndpoint> endpoints;
+        IReadOnlyList<DiscoveryResult> discoveryResults;
         try
         {
-            endpoints = terminalOutput
+            var coordinator = DiscoveryModuleFactory.CreateDefault();
+            var discover = new Func<IReadOnlyList<DiscoveryResult>>(() => coordinator.Discover(mechanisms));
+            var results = terminalOutput
                 ? await AnsiConsole.Status().Spinner(Spinner.Known.Dots).SpinnerStyle(Style.Parse("cyan"))
-                    .StartAsync("Discovering named-pipe endpoints…", _ => Task.FromResult(new PipeEnumerator().Discover()))
-                : new PipeEnumerator().Discover();
+                    .StartAsync("Discovering IPC endpoints…", _ => Task.FromResult(discover()))
+                : discover();
+            discoveryResults = results;
+            endpoints = results.SelectMany(result => result.Endpoints).ToArray();
+            if (results.Count > 0 && results.All(result => result.Error is not null))
+                throw new InvalidOperationException(string.Join("; ", results.Select(result => $"{result.Mechanism}: {result.Error}")));
         }
-        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or PlatformNotSupportedException)
+        catch (Exception ex) when (ex is System.ComponentModel.Win32Exception or PlatformNotSupportedException or InvalidOperationException)
         {
             AnsiConsole.MarkupLine($"[red]Discovery failed:[/] {Markup.Escape(ex.Message)}");
             return 1;
         }
 
         var inspected = inspectAcl ? await InspectSecurityWindowsAsync(endpoints, terminalOutput) : endpoints;
+        foreach (var result in discoveryResults.Where(result => result.Error is not null))
+        {
+            var message = $"{result.Mechanism} discovery unavailable: {result.Error}";
+            if (terminalOutput) AnsiConsole.MarkupLine($"[yellow]{Markup.Escape(message)}[/]");
+            else Console.Error.WriteLine(message);
+        }
+        var existingEvents = ReadEventsForEndpoints(inspected, GetDatabasePath(options));
+        inspected = IpcCorrelationAnalyzer.Enrich(inspected, existingEvents);
         SnapshotSaveResult? snapshotResult = null;
         if (saveSnapshot)
         {
@@ -105,9 +126,11 @@ public static class SutraApp
         }
 
         var selected = ScanReportFormatter.FilterAndSort(inspected, filter);
-        var recentEvents = ReadEventsForEndpoints(selected, GetDatabasePath(options));
+        var selectedNames = new HashSet<string>(selected.Where(endpoint => endpoint.IpcMechanism == "NamedPipe")
+            .Select(endpoint => endpoint.Name), StringComparer.OrdinalIgnoreCase);
+        var recentEvents = existingEvents.Where(item => selectedNames.Contains(item.PipeName)).ToArray();
         var source = snapshotResult is null ? "Live scan" : $"Snapshot {snapshotResult.Snapshot.Id}";
-        var report = ScanReportFormatter.CreateDocument(selected, source, recentEvents);
+        var report = ScanReportFormatter.CreateDocument(selected, source, recentEvents, discoveryResults);
         if (options.TryGetValue("--output", out var outputPath))
         {
             try
@@ -121,7 +144,7 @@ public static class SutraApp
                 return 1;
             }
         }
-        else if (terminalOutput) RenderResults(selected, inspectAcl);
+        else if (terminalOutput) RenderResults(selected, inspectAcl, discoveryResults);
         else Console.Write(RenderFormat(format, report, selected, recentEvents));
 
         if (snapshotResult is not null)
@@ -262,7 +285,7 @@ public static class SutraApp
 
     private static int RunStoredReport(string[] args)
     {
-        string[] reportOptions = ["--db", "--snapshot", "--format", "--output", "--scope", "--search", "--process", "--service", "--elevated", "--severity", "--sort", "--order", "--limit"];
+        string[] reportOptions = ["--db", "--snapshot", "--format", "--output", "--scope", "--mechanism", "--search", "--process", "--service", "--elevated", "--severity", "--sort", "--order", "--limit"];
         if (!TryParseOptions(args, [], reportOptions, out var options, out var error))
         {
             AnsiConsole.MarkupLine($"[red]{Markup.Escape(error!)}[/]");
@@ -404,10 +427,53 @@ public static class SutraApp
         if (!TryGetIntOption(options, "--limit", 100_000, 1, 100_000, out var limit))
         { filter = new EndpointReportFilter(); error = "--limit must be between 1 and 100000."; return false; }
 
+        var mechanism = Value(options, "--mechanism");
+        if (mechanism is not null && !TryNormalizeMechanism(mechanism, out mechanism))
+        { filter = new EndpointReportFilter(); error = "--mechanism must be named-pipe, rpc, com, or alpc."; return false; }
+
         filter = new EndpointReportFilter(
-            Value(options, "--scope"), Value(options, "--search"), Value(options, "--process"), Value(options, "--service"),
+            Value(options, "--scope"), mechanism, Value(options, "--search"), Value(options, "--process"), Value(options, "--service"),
             elevated, severity, sort, order, limit);
         return true;
+    }
+
+    private static bool TryGetMechanisms(IReadOnlyDictionary<string, string?> options,
+        out IReadOnlyList<string> mechanisms, out string? error)
+    {
+        error = null;
+        if (!options.TryGetValue("--mechanisms", out var raw))
+        {
+            mechanisms = ["all"];
+            return true;
+        }
+        var selected = new List<string>();
+        foreach (var value in raw!.Split(',', StringSplitOptions.TrimEntries | StringSplitOptions.RemoveEmptyEntries))
+        {
+            if (value.Equals("all", StringComparison.OrdinalIgnoreCase))
+            {
+                if (selected.Count != 0 || raw.Contains(','))
+                { mechanisms = Array.Empty<string>(); error = "Use 'all' by itself in --mechanisms."; return false; }
+                selected.Add("all");
+            }
+            else if (TryNormalizeMechanism(value, out var normalized)) selected.Add(normalized);
+            else { mechanisms = Array.Empty<string>(); error = $"Unknown IPC mechanism '{value}'. Choose named-pipe, rpc, com, alpc, or all."; return false; }
+        }
+        if (selected.Count == 0) { mechanisms = Array.Empty<string>(); error = "--mechanisms requires at least one mechanism."; return false; }
+        mechanisms = selected.Distinct(StringComparer.OrdinalIgnoreCase).ToArray();
+        return true;
+    }
+
+    private static bool TryNormalizeMechanism(string value, out string normalized)
+    {
+        normalized = value.Trim().ToUpperInvariant() switch
+        {
+            "PIPE" or "PIPES" or "NAMEDPIPE" or "NAMED-PIPES" or "NAMED-PIPE" => "NamedPipe",
+            "RPC" => "RPC",
+            "COM" => "COM",
+            "ALPC" => "ALPC",
+            _ => string.Empty
+        };
+        return normalized.Length > 0;
     }
 
     private static string? Value(IReadOnlyDictionary<string, string?> options, string key) =>
@@ -495,6 +561,7 @@ public static class SutraApp
             var directResults = new List<PipeEndpoint>(endpoints.Count);
             foreach (var endpoint in endpoints)
             {
+                if (endpoint.IpcMechanism != "NamedPipe") { directResults.Add(endpoint); continue; }
                 var inspected = inspector.Inspect(endpoint);
                 directResults.Add(inspected.SecurityStatus == "Inspected"
                     ? inspected with { Findings = analyzer.Analyze(inspected) }
@@ -510,6 +577,12 @@ public static class SutraApp
             var results = new List<PipeEndpoint>(endpoints.Count);
             foreach (var endpoint in endpoints)
             {
+                if (endpoint.IpcMechanism != "NamedPipe")
+                {
+                    results.Add(endpoint);
+                    task.Increment(1);
+                    continue;
+                }
                 var inspected = inspector.Inspect(endpoint);
                 results.Add(inspected.SecurityStatus == "Inspected"
                     ? inspected with { Findings = analyzer.Analyze(inspected) }
@@ -533,8 +606,9 @@ public static class SutraApp
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey35);
         table.AddColumn(new TableColumn("[cyan]Command[/]"));
         table.AddColumn(new TableColumn("[cyan]Description[/]"));
-        table.AddRow("[white]sutra scan[/]", "Discover named pipes without connecting to endpoints.");
-        table.AddRow("[white]sutra scan --inspect-acl[/]", "Inspect ACLs, server process context, services, and permissions.");
+        table.AddRow("[white]sutra scan[/]", "Discover named pipes, RPC endpoints, COM registrations, and visible ALPC ports.");
+        table.AddRow("[white]sutra scan --inspect-acl[/]", "Inspect named-pipe ACLs, server process context, services, and permissions.");
+        table.AddRow("[white]sutra scan --mechanisms named-pipe,rpc[/]", "Select one or more IPC discovery modules.");
         table.AddRow("[white]sutra scan --snapshot[/]", "Save endpoint metadata and compare it with the prior snapshot.");
         table.AddRow("[white]sutra history[/]", "List saved scan snapshots.");
         table.AddRow("[white]sutra changes[/]", "Compare the two most recent snapshots.");
@@ -546,19 +620,23 @@ public static class SutraApp
         table.AddRow("[white]--db <path>[/]", "Select the SQLite database file for history and events.");
         table.AddRow("[white]--format table|ascii|json|dot[/]", "Choose a terminal view or report format for scan/report.");
         table.AddRow("[white]--search <text> --sort <field>[/]", "Search and order endpoint results.");
+        table.AddRow("[white]--mechanism <type>[/]", "Filter results by named-pipe, rpc, com, or alpc.");
+        table.AddRow("[white]--mechanisms <list>[/]", "Select discovery modules, for example named-pipe,rpc.");
         table.AddRow("[white]--output <path>[/]", "Write the selected report format to a file.");
         table.AddRow("[white]sutra help[/]", "Show this help.");
         AnsiConsole.Write(table);
-        AnsiConsole.MarkupLine("[grey]Inspection opens each pipe and may briefly connect to its server. This can trigger server connection handling; use only when acceptable.[/]");
+        AnsiConsole.MarkupLine("[grey]ACL inspection opens named pipes and may briefly connect to their servers. This can trigger server connection handling.[/]");
+        AnsiConsole.MarkupLine("[grey]RPC, COM, and ALPC results are registration or name inventories. They do not identify every live server process. ALPC coverage is best effort.[/]");
         AnsiConsole.MarkupLine("[grey]Permission findings are contextual indicators. They do not prove exploitability or evaluate effective access across all ACEs.[/]");
         AnsiConsole.MarkupLine("[grey]Sysmon correlation requires Sysmon and readable Event ID 17/18 records in Microsoft-Windows-Sysmon/Operational.[/]");
     }
 
-    private static void RenderResults(IReadOnlyList<PipeEndpoint> endpoints, bool aclRequested)
+    private static void RenderResults(IReadOnlyList<PipeEndpoint> endpoints, bool aclRequested, IReadOnlyList<DiscoveryResult>? discoveryResults = null)
     {
         var table = new Table().Border(TableBorder.Rounded).BorderColor(Color.Grey35);
+        table.AddColumn("Mechanism");
         table.AddColumn(new TableColumn("Endpoint").NoWrap());
-        table.AddColumn("Found");
+        table.AddColumn("Status");
         if (aclRequested)
         {
             table.AddColumn("ACL");
@@ -569,21 +647,40 @@ public static class SutraApp
 
         foreach (var endpoint in endpoints)
         {
-            var discovery = endpoint.DiscoveryStatus == "Discovered" ? "[green]Found[/]" : "[red]Unavailable[/]";
+            var discovery = endpoint.DiscoveryStatus switch
+            {
+                "Discovered" => "[green]Found[/]",
+                "Registered" => "[cyan]Registered[/]",
+                _ => "[red]Unavailable[/]"
+            };
             var pid = endpoint.ServerProcessId?.ToString() ?? "[grey]—[/]";
             if (aclRequested)
             {
-                var status = endpoint.SecurityStatus == "Inspected" ? "[green]Read[/]" : "[yellow]Unavailable[/]";
-                table.AddRow(Markup.Escape(Shorten(endpoint.Name, 38)), discovery, status,
+                var status = endpoint.IpcMechanism != "NamedPipe" ? "[grey]N/A[/]"
+                    : endpoint.SecurityStatus == "Inspected" ? "[green]Read[/]" : "[yellow]Unavailable[/]";
+                table.AddRow(Markup.Escape(endpoint.IpcMechanism), Markup.Escape(Shorten(endpoint.Name, 38)), discovery, status,
                     Markup.Escape(Shorten(endpoint.OwnerSid ?? "—", 24)), endpoint.AccessEntries?.Count.ToString() ?? "—", pid);
             }
-            else table.AddRow(Markup.Escape(Shorten(endpoint.Name, 46)), discovery, pid);
+            else table.AddRow(Markup.Escape(endpoint.IpcMechanism), Markup.Escape(Shorten(endpoint.Name, 46)), discovery, pid);
         }
 
         AnsiConsole.Write(table);
         AnsiConsole.WriteLine();
         var inspectedCount = endpoints.Count(e => e.SecurityStatus == "Inspected");
-        AnsiConsole.MarkupLine($"[cyan]Scan summary[/]  endpoints [white]{endpoints.Count}[/]  ·  security descriptors [white]{inspectedCount}[/]/{(aclRequested ? endpoints.Count : 0)}  ·  process contexts [white]{endpoints.Count(e => e.ServerProcessId.HasValue)}[/]");
+        var pipeCount = endpoints.Count(endpoint => endpoint.IpcMechanism == "NamedPipe");
+        AnsiConsole.MarkupLine($"[cyan]Scan summary[/]  endpoints [white]{endpoints.Count}[/]  ·  security descriptors [white]{inspectedCount}[/]/{(aclRequested ? pipeCount : 0)} pipes  ·  process contexts [white]{endpoints.Count(e => e.ServerProcessId.HasValue)}[/]");
+        var mechanismSummary = string.Join("  ·  ", endpoints.GroupBy(endpoint => endpoint.IpcMechanism, StringComparer.OrdinalIgnoreCase)
+            .OrderBy(group => group.Key, StringComparer.OrdinalIgnoreCase).Select(group => $"{Markup.Escape(group.Key)} [white]{group.Count()}[/]"));
+        AnsiConsole.MarkupLine("[cyan]Mechanisms[/]  " + (mechanismSummary.Length == 0 ? "[grey]none[/]" : mechanismSummary));
+        if (discoveryResults is { Count: > 0 })
+        {
+            var coverage = new Table().Border(TableBorder.Simple);
+            coverage.AddColumn("Module"); coverage.AddColumn("Endpoints"); coverage.AddColumn("Coverage");
+            foreach (var result in discoveryResults)
+                coverage.AddRow(result.Mechanism, result.Error is null ? result.Endpoints.Count.ToString() : "[yellow]Unavailable[/]",
+                    Markup.Escape(Shorten(result.Error ?? result.Coverage, 52)));
+            AnsiConsole.Write(coverage);
+        }
         if (aclRequested)
         {
             var allFindings = endpoints.SelectMany(e => e.Findings ?? Array.Empty<RiskFinding>()).ToArray();
@@ -593,7 +690,7 @@ public static class SutraApp
 
         if (aclRequested)
         {
-            var aclRows = endpoints.Where(e => e.AccessEntries is not null).ToArray();
+            var aclRows = endpoints.Where(e => e.IpcMechanism == "NamedPipe" && e.AccessEntries is not null).ToArray();
             foreach (var endpoint in aclRows)
             {
                 AnsiConsole.WriteLine();

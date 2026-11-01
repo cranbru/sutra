@@ -14,7 +14,9 @@ public sealed record PipeEndpoint(
     string? DaclState = null,
     IReadOnlyList<PipeAce>? AccessEntries = null,
     IReadOnlyList<RiskFinding>? Findings = null,
-    string? Error = null);
+    string? Error = null,
+    string IpcMechanism = "NamedPipe",
+    string? DiscoveryDetails = null);
 
 public sealed record PipeAce(string Type, string Sid, string Rights, string Flags);
 

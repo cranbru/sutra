@@ -83,7 +83,7 @@ public sealed class ReportFormatterTests
 
         var graph = ScanReportFormatter.ToAscii([endpoint]);
 
-        Assert.Contains("`- PIPE Example", graph);
+        Assert.Contains("`- NAMEDPIPE Example", graph);
         Assert.Contains("`- SERVER server (PID 4", graph);
     }
 
